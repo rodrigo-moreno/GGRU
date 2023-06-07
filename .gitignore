@@ -1,0 +1,9 @@
+# Ignore recovery files
+*.swp
+
+# Ignore test files
+*test*
+
+# Ignore cache
+__pycache__/*
+
