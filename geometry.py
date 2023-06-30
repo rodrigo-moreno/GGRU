@@ -11,14 +11,6 @@ import torch.nn as nn
 ################################################################################
 ### GEOMETRIC RNN
 
-class GRNN(nn.Module):
-    def __init__(self, celltype, Wg):
-        pass
-
-    def forward(self):
-        pass
-
-
 class GRNNCell(nn.Module):
     """
     A RNN that works with an implicit geometric interaction matrix underlying
@@ -78,38 +70,109 @@ class GGRUCell(nn.Module):
                                            bias)
                                 )
 
-        # Last things
+
+class SGGRU(nn.Module):
+    '''
+    An implementation of the Geometric GRU suggested after discussion with
+    Alessio.
+    '''
+    def __init__(self, input_size, hidden_size, Wg, h0 = None, bias = False,
+                 optim = None, final = None):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
         self.Wg = Wg
         if h0 is None:
-            self.hp = torch.zeros((hidden_size * 1, ))
-            self.hg = torch.zeros((hidden_size * 1, ))
-        self.init_params()
-        self.alpha = alpha
-        if optim is None:
-            self.optim = torch.optim.SGD
-
-    def init_params(self):
-        i = torch.eye(self.hidden_size)
-        self.geometric.weight_ih = nn.Parameter(torch.cat((i,
-                                                           i,
-                                                           i)),
-                                                requires_grad = False)
-        self.geometric.weight_hh = nn.Parameter(torch.cat((self.Wg,
-                                                           self.Wg,
-                                                           self.Wg)),
-                                                requires_grad = False)
+            self.hp = torch.zeros(hidden_size)
+            self.hg = torch.zeros(hidden_size)
+        
+        # Declare layers
+        self.mlp = nn.Sequential(nn.Linear(self.input_size,
+                                           self.hidden_size,
+                                           bias),
+                                 nn.Tanh(),
+                                )
+        self.synaptic = SGGRUCell(self.hidden_size,
+                                  self.hidden_size,
+                                  Wg,
+                                  h0)
+        self.geometric = nn.GRUCell(self.hidden_size,
+                                    self.hidden_size,
+                                    bias)
+        new_hh = torch.cat((Wg, Wg, Wg), 0)
+        self.geometric.weight_hh = nn.Parameter(new_hh, requires_grad = False)
+        self.final = final
+        if final is not None:
+            if final == 'linear':
+                self.end_layer = nn.Linear(hidden_size, hidden_size, bias)
+            elif final == 'GRU':
+                self.end_layer = nn.GRUCell(hidden_size, hidden_size, bias)
+            else:
+                raise TypeError(f'Layer of type {final} has not been'
+                                f'implemented.')
 
     def forward(self, input_):
-        h_hat = self.synaptic.forward(input_, self.hp)
-        self.hg = self.geometric.forward(h_hat, self.hg)
-        self.hp = (1 - self.alpha)*h_hat + self.alpha*self.hg
-        self.o = self.mlp(self.hp)
-        return (self.hp, self.hg, self.o)
+        with torch.autograd.set_detect_anomaly(True):
+            filter_ = self.mlp(input_)
+            self.hp = self.synaptic(filter_, self.hg)
+            self.hg = self.geometric(self.hp)
+            if self.final:
+                out = self.end_layer(self.hp)
+                return out
+            return (self.hp)
 
 
-    def backwards(self):
-        optim1 = self.optim(self.synaptic.params(), lr = 0.01)
-        optim2 = self.optim(self.mlp.params(), lr = 0.01)
+class SGGRUCell(nn.Module):
+    '''
+    Implementation of a single time instance of the recurrent cell with spatial
+    memory.
+    '''
+    def __init__(self, input_size, hidden_size, Wg, h0 = None, bias = False,
+                 optim = None):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        # Initialize Parameters
+        self.weight_xz = nn.Parameter(torch.rand((hidden_size, input_size)),
+                                      requires_grad = True)
+        self.weight_hz = nn.Parameter(torch.rand((hidden_size, hidden_size)),
+                                      requires_grad = True)
+        #self.weight_gpz = nn.Parameter(Wg, requires_grad = False)
+        self.weight_gpz = nn.Parameter(torch.rand((hidden_size, hidden_size)),
+                                       requires_grad = True)
+        self.weight_xr = nn.Parameter(torch.rand((hidden_size, input_size)),
+                                      requires_grad = True)
+        self.weight_hr = nn.Parameter(torch.rand((hidden_size, hidden_size)),
+                                      requires_grad = True)
+        #self.weight_gpr = nn.Parameter(Wg, requires_grad = False)
+        self.weight_gpr = nn.Parameter(torch.rand((hidden_size, hidden_size)),
+                                       requires_grad = True)
+        self.weight_xn = nn.Parameter(torch.rand((hidden_size, input_size)),
+                                      requires_grad = True)
+        #self.weight_gpn = nn.Parameter(Wg, requires_grad = False)
+        self.weight_gpn = nn.Parameter(torch.rand((hidden_size, hidden_size)),
+                                       requires_grad = True)
+
+        # Initialize Memory
+        if h0 is None:
+            self.h = torch.zeros(self.hidden_size)
+
+    def forward(self, input_, hg):
+        z = torch.sigmoid(self.weight_xz @ input_ +
+                          self.weight_hz @ self.h +
+                          self.weight_gpz @ hg)
+        r = torch.sigmoid(self.weight_xr @ input_ +
+                          self.weight_hr @ self.h +
+                          self.weight_gpr @ hg)
+        n = torch.tanh(self.weight_xn @ input_ +
+                       self.weight_gpn @ hg +
+                       r * self.h)
+        self.h = (1 - z)*self.h + z*n
+        return self.h
+        # Not used because it is inconvenient as a matrix
+        len_ = int(np.sqrt(len(self.h)))
+        return self.h.reshape((len_, len_))
 
 
 
@@ -119,8 +182,107 @@ class GGRUCell(nn.Module):
 ################################################################################
 ################################################################################
 ### GEOMETRIC INTERACTION MATRICES
+def base_dmatrix(n):
+    '''
+    Creates the basic distance matrix in an nxn grid. Currently implemented
+    only for odd values of n. Each element of this matrix tells what the
+    Euclidean distance to the center is.
+
+    Input:
+    - n: amount of elements in each row/column.
+
+    Output:
+    - distances: and nxn array of distances to the center.
+    '''
+    if n % 2 == 0:
+        raise ValueError('Currently not implemented for even n.')
+    bound = n // 2
+    disp = [[(ii, jj) for jj in range(-bound, bound + 1)]
+            for ii in range(-bound, bound + 1)]
+    distances = [[np.sqrt(disp[ii][jj][0]**2 + disp[ii][jj][1]**2)
+                  for jj in range(n)]
+                 for ii in range(n)]
+    return np.array(distances)
+
+
+def exchange_matrix(n, drow, dcol):
+    '''
+    Generates the matrices needed to exchange rows and columns. All changes
+    are shifts: all rows/columns are moved in the same direction, by the same
+    amount. If any reaches the beginning/end, they move to the other side.
+
+    Input:
+    - n: number denoting the amount of rows/columns in the matrix to be shifted.
+    - drow: displacement in rows. Possitive number means moving the rows down.
+      A negative number means moving the rows up.
+    - dcol: displacement in columns. Possitive number means shifting the columns
+      to the right. A negative number means moving them left.
+
+    Output:
+    - tuple containing F, the pre-multiplying matrix to shift rows, and C, the
+      post-multiplying matrix to shift columns. Both matrices are nxn.
+    '''
+    F = np.zeros((n, n))
+    C = np.zeros((n, n))
+    for ii in range(n):
+        new_row = (ii + drow) % n
+        F[new_row, ii] = 1
+        new_col = (ii + dcol) % n
+        C[ii, new_col] = 1
+    return (F, C)
+
+
+def general_dmatrix(n):
+    '''
+    Creates the matrix of distances between all elements in an nxn, evenly-
+    spaced grid.
+
+    Currently implemented only for odd values of n.
+    
+    Input:
+    - n: the size of the square grid of 'interactions'.
+
+    Output:
+    - overall: an (n**2)x(n**2) matrix of distances between ALL elements in the
+      grid.
+    '''
+    if n % 2 == 0:
+        raise ValueError('Currently not implemented for even n.')
+    basal = base_dmatrix(n)
+    overall = np.zeros((n**2, n**2))
+    bound = n // 2
+    disp = [[(ii, jj) for jj in range(-bound, bound + 1)]
+            for ii in range(-bound, bound + 1)]
+    flat_disp = []
+    for pos, val in enumerate(disp):
+        flat_disp += val
+    for pos, val in enumerate(flat_disp):
+        drow, dcol = val
+        F, C = exchange_matrix(n, drow, dcol)
+        dmatrix = F @ basal @ C
+        overall[pos, :] = dmatrix.flatten().copy()
+    return overall
+
+
+def normalize(matrix):
+    '''
+    Normalizes the matrix so that the sum over the columns equals 0, and the
+    sum of the squares over the column equals 1.
+
+    Input:
+    - matrix: the matrix to be normalized.
+
+    Output:
+    - a normalized version of the same matrix.
+    '''
+    c = sum(matrix)[0]
+    matrix = matrix - (c / matrix.shape[0])
+    a = sum(matrix ** 2)[0]
+    return matrix / np.sqrt(a)
+
+
 def make_planar_weightmatrix(len_x:int, len_y:int,
-                              long_range_inhibition = False):
+                              long_range_inhibition = True):
     '''
     A function that makes a planar weight matrix of the interactions of cells
     distributed in a plane. All cells have the same separation between them.
@@ -139,12 +301,19 @@ def make_planar_weightmatrix(len_x:int, len_y:int,
       difference in values between the two functions for long range inhibition.
       Will do later.
     '''
-    combinations = list(product(range(len_x), range(len_y)))
-    weights = distance_matrix(combinations, combinations)
-    weights = LFP(weights)
-    for ii in range(weights.shape[0]):
-        weights[ii, ii] = 0
-    return torch.Tensor(weights)
+    if not long_range_inhibition:
+        def LFP(x):
+            return np.exp(-x)
+    else:
+        def LFP(x):
+            x = np.exp(-0.9*x) - 0.4*np.exp(-0.2*x)
+            return x
+    gm = general_dmatrix(len_x)
+    gm = LFP(gm)
+    gm = normalize(gm)
+    #for ii in range(weights.shape[0]):
+        #weights[ii, ii] = 0
+    return torch.Tensor(gm)
 
 
 def input_vector_generator(t, grid, label = False, long = False):
